@@ -1,12 +1,9 @@
 import os
 import sqlite3
-import base64
-import mimetypes
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-from openai import OpenAI
 import google.generativeai as genai
 
 
@@ -18,9 +15,11 @@ st.set_page_config(
     layout="wide"
 )
 
-OPENAI_MODEL_NAME = "gpt-5"
-GEMINI_MODEL_NAME = "gemini-1.5-flash"
-RULE_VERSION = "v1.6"
+GEMINI_MODEL_OPTIONS = [
+    "gemini-2.5-pro",
+    "gemini-2.5-flash"
+]
+RULE_VERSION = "v1.7"
 DB_FILE = "builder_logs.db"
 RULES_DIR = "rules"
 
@@ -28,17 +27,13 @@ RULES_DIR = "rules"
 # =========================
 # API 키 확인
 # =========================
-openai_api_key = os.getenv("OPENAI_API_KEY")
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 
-if not openai_api_key and not gemini_api_key:
-    st.error("OPENAI_API_KEY 또는 GEMINI_API_KEY 중 최소 하나는 설정되어 있어야 합니다.")
+if not gemini_api_key:
+    st.error("GEMINI_API_KEY가 설정되어 있지 않습니다.")
     st.stop()
 
-openai_client = OpenAI(api_key=openai_api_key) if openai_api_key else None
-
-if gemini_api_key:
-    genai.configure(api_key=gemini_api_key)
+genai.configure(api_key=gemini_api_key)
 
 
 # =========================
@@ -52,10 +47,11 @@ def init_db():
         created_at TEXT,
         user_name TEXT,
         user_id TEXT,
-        llm_provider TEXT,
+        gemini_model_name TEXT,
         mode TEXT,
         requirement TEXT,
         structure_text TEXT,
+        supplement_text TEXT,
         table_image_names TEXT,
         table_excel_names TEXT,
         function_image_names TEXT,
@@ -63,7 +59,8 @@ def init_db():
         spec_final TEXT,
         structured_spec TEXT,
         code TEXT,
-        feedback TEXT,
+        spec_feedback TEXT,
+        code_feedback TEXT,
         rule_version TEXT,
         spec_confirmed TEXT
     )
@@ -201,96 +198,21 @@ CODE 생성 규칙:
 
 
 # =========================
-# 업로드 유틸
+# Gemini 호출
 # =========================
-def uploaded_image_to_data_url(uploaded_file) -> str:
-    mime_type = uploaded_file.type or mimetypes.guess_type(uploaded_file.name)[0] or "image/png"
-    file_bytes = uploaded_file.getvalue()
-    encoded = base64.b64encode(file_bytes).decode("utf-8")
-    return f"data:{mime_type};base64,{encoded}"
-
-
-def uploaded_file_to_base64(uploaded_file) -> str:
-    file_bytes = uploaded_file.getvalue()
-    return base64.b64encode(file_bytes).decode("utf-8")
-
-
-def build_multimodal_input(prompt_text: str, images=None, files=None):
-    content = [{"type": "input_text", "text": prompt_text}]
-
-    if images:
-        for img in images:
-            content.append({
-                "type": "input_image",
-                "image_url": uploaded_image_to_data_url(img),
-                "detail": "auto"
-            })
-
-    if files:
-        for f in files:
-            mime_type = f.type or mimetypes.guess_type(f.name)[0] or "application/octet-stream"
-            base64_data = uploaded_file_to_base64(f)
-            content.append({
-                "type": "input_file",
-                "filename": f.name,
-                "file_data": f"data:{mime_type};base64,{base64_data}"
-            })
-
-    return [{"role": "user", "content": content}]
-
-
-# =========================
-# LLM 호출
-# =========================
-def ask_openai_text_only(prompt: str) -> str:
-    if not openai_client:
-        raise ValueError("OpenAI API 키가 설정되어 있지 않습니다.")
-    response = openai_client.responses.create(
-        model=OPENAI_MODEL_NAME,
-        input=prompt
-    )
-    return response.output_text
-
-
-def ask_openai_multimodal(prompt: str, images=None, files=None) -> str:
-    if not openai_client:
-        raise ValueError("OpenAI API 키가 설정되어 있지 않습니다.")
-    response = openai_client.responses.create(
-        model=OPENAI_MODEL_NAME,
-        input=build_multimodal_input(prompt, images, files)
-    )
-    return response.output_text
-
-
-def ask_gemini_text_only(prompt: str) -> str:
-    if not gemini_api_key:
-        raise ValueError("GEMINI_API_KEY가 설정되어 있지 않습니다.")
-    model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+def ask_gemini_text_only(prompt: str, gemini_model_name: str) -> str:
+    model = genai.GenerativeModel(gemini_model_name)
     response = model.generate_content(prompt)
     return response.text
 
 
-def ask_llm_text_only(prompt: str, llm_provider: str) -> str:
-    if llm_provider == "OpenAI":
-        return ask_openai_text_only(prompt)
-    elif llm_provider == "Gemini":
-        return ask_gemini_text_only(prompt)
-    else:
-        raise ValueError("지원하지 않는 LLM입니다.")
-
-
-def ask_llm_multimodal(prompt: str, llm_provider: str, images=None, files=None) -> str:
-    if llm_provider == "OpenAI":
-        return ask_openai_multimodal(prompt, images=images, files=files)
-    elif llm_provider == "Gemini":
-        gemini_note = """
+def ask_gemini_with_upload_summary(prompt: str, gemini_model_name: str) -> str:
+    note = """
 [참고]
-현재 Gemini 모드는 1차 테스트 버전으로 텍스트 중심으로 동작합니다.
-업로드된 이미지/파일의 상세 분석 대신, 업로드 개수 및 사용자 입력 설명을 중심으로 반영합니다.
+현재 업로드된 이미지/파일은 개수와 사용자 입력 설명 중심으로 반영한다.
+이미지 원문 판독 결과를 절대 단정하지 말고, 사용자가 제공한 텍스트와 함께 보수적으로 해석한다.
 """
-        return ask_gemini_text_only(gemini_note + "\n" + prompt)
-    else:
-        raise ValueError("지원하지 않는 LLM입니다.")
+    return ask_gemini_text_only(note + "\n" + prompt, gemini_model_name)
 
 
 # =========================
@@ -299,7 +221,7 @@ def ask_llm_multimodal(prompt: str, llm_provider: str, images=None, files=None) 
 def generate_spec_draft(
     requirement: str,
     structure_text: str,
-    llm_provider: str,
+    gemini_model_name: str,
     table_images=None,
     table_files=None
 ) -> str:
@@ -330,15 +252,15 @@ def generate_spec_draft(
 지시사항:
 - CM_스펙템플릿.md 구조를 최대한 유지하여 작성
 - 초안 SPEC으로 작성
-- 업로드된 테이블/구조 캡처와 파일 내용을 우선 사용
+- 업로드된 테이블/구조 캡처와 파일 정보를 우선 사용
 - 사용자가 명시하지 않은 DDIC/Z 객체 구조는 추정하지 말 것
 - 구조 정보가 불충분하면 TBD 또는 확인 필요로 명시
 - 확정 필요 항목을 마지막에 반드시 정리할 것
 """
-    return ask_llm_multimodal(prompt, llm_provider, images=table_images, files=table_files)
+    return ask_gemini_with_upload_summary(prompt, gemini_model_name)
 
 
-def generate_final_spec(spec_draft: str, supplement_text: str, llm_provider: str) -> str:
+def generate_final_spec(spec_draft: str, supplement_text: str, gemini_model_name: str) -> str:
     prompt = f"""
 {BASE_RULES}
 
@@ -358,10 +280,10 @@ def generate_final_spec(spec_draft: str, supplement_text: str, llm_provider: str
 - 확정된 항목은 TBD로 남기지 말 것
 - 최종 SPEC 형태로 재정리하라
 """
-    return ask_llm_text_only(prompt, llm_provider)
+    return ask_gemini_text_only(prompt, gemini_model_name)
 
 
-def generate_structured_spec(spec_text: str, llm_provider: str) -> str:
+def generate_structured_spec(spec_text: str, gemini_model_name: str) -> str:
     prompt = f"""
 {BASE_RULES}
 
@@ -370,13 +292,13 @@ def generate_structured_spec(spec_text: str, llm_provider: str) -> str:
 [입력 SPEC]
 {spec_text}
 """
-    return ask_llm_text_only(prompt, llm_provider)
+    return ask_gemini_text_only(prompt, gemini_model_name)
 
 
 def generate_code(
     spec_text: str,
     structured_spec_text: str,
-    llm_provider: str,
+    gemini_model_name: str,
     function_images=None
 ) -> str:
     function_summary = f"""
@@ -403,11 +325,11 @@ def generate_code(
 지시사항:
 - ABAP REPORT 프로그램 코드 초안 작성
 - INCLUDE 구조 포함
-- 업로드된 함수 캡처가 있으면 그 인터페이스 기준으로 작성
+- 업로드된 함수 캡처 정보가 있으면 그 인터페이스 기준으로 작성
 - 제공되지 않은 Function 인터페이스는 추정하지 말 것
 - 스펙 없는 기능은 절대 추가하지 말 것
 """
-    return ask_llm_multimodal(prompt, llm_provider, images=function_images, files=None)
+    return ask_gemini_with_upload_summary(prompt, gemini_model_name)
 
 
 # =========================
@@ -416,10 +338,11 @@ def generate_code(
 def save_log(
     user_name: str,
     user_id: str,
-    llm_provider: str,
+    gemini_model_name: str,
     mode: str,
     requirement: str,
     structure_text: str,
+    supplement_text: str,
     table_image_names: str,
     table_excel_names: str,
     function_image_names: str,
@@ -427,26 +350,28 @@ def save_log(
     spec_final: str,
     structured_spec: str,
     code: str,
-    feedback: str,
+    spec_feedback: str,
+    code_feedback: str,
     rule_version: str,
     spec_confirmed: str
 ):
     conn.execute("""
     INSERT INTO logs (
-        created_at, user_name, user_id, llm_provider, mode,
-        requirement, structure_text, table_image_names, table_excel_names, function_image_names,
+        created_at, user_name, user_id, gemini_model_name, mode,
+        requirement, structure_text, supplement_text, table_image_names, table_excel_names, function_image_names,
         spec_draft, spec_final, structured_spec, code,
-        feedback, rule_version, spec_confirmed
+        spec_feedback, code_feedback, rule_version, spec_confirmed
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         user_name,
         user_id,
-        llm_provider,
+        gemini_model_name,
         mode,
         requirement,
         structure_text,
+        supplement_text,
         table_image_names,
         table_excel_names,
         function_image_names,
@@ -454,7 +379,8 @@ def save_log(
         spec_final,
         structured_spec,
         code,
-        feedback,
+        spec_feedback,
+        code_feedback,
         rule_version,
         spec_confirmed
     ))
@@ -463,7 +389,7 @@ def save_log(
 
 def load_logs() -> pd.DataFrame:
     return pd.read_sql_query("""
-        SELECT id, created_at, user_name, user_id, llm_provider, mode, rule_version, spec_confirmed, feedback
+        SELECT id, created_at, user_name, user_id, gemini_model_name, mode, rule_version, spec_confirmed
         FROM logs
         ORDER BY id DESC
     """, conn)
@@ -479,6 +405,14 @@ defaults = {
     "structured_spec": "",
     "code": "",
     "spec_confirmed": False,
+    "requirement_text": "",
+    "structure_text_saved": "",
+    "supplement_text": "",
+    "table_image_names": "",
+    "table_excel_names": "",
+    "function_image_names": "",
+    "spec_feedback": "",
+    "code_feedback": ""
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -587,22 +521,17 @@ with st.sidebar:
     user_name = st.text_input("사용자 이름", placeholder="예: 김효림")
     user_id = st.text_input("사번", placeholder="예: 2201003")
 
-    available_llms = []
-    if openai_api_key:
-        available_llms.append("OpenAI")
-    if gemini_api_key:
-        available_llms.append("Gemini")
-
-    llm_provider = st.selectbox("LLM 선택", available_llms)
+    gemini_model_name = st.selectbox(
+        "Gemini 모델 선택",
+        GEMINI_MODEL_OPTIONS,
+        index=0
+    )
 
     st.markdown(f"**지침 버전:** {RULE_VERSION}")
-    st.markdown(f"**OpenAI 모델:** {OPENAI_MODEL_NAME}")
-    st.markdown(f"**Gemini 모델:** {GEMINI_MODEL_NAME}")
+    st.markdown(f"**Gemini 모델:** {gemini_model_name}")
     st.markdown(f"**SPEC 템플릿 파일:** {'정상 로드' if spec_template_doc != 'SPEC 템플릿 문서 없음' else '미로드'}")
     st.markdown(f"**ABAP 패턴 파일:** {'정상 로드' if abap_pattern_doc != 'ABAP 패턴 문서 없음' else '미로드'}")
-
-    if llm_provider == "Gemini":
-        st.info("Gemini는 현재 1차 테스트용으로 텍스트 중심 비교 테스트에 적합합니다.")
+    st.info("현재 Gemini 기반으로 동작합니다.")
 
 st.markdown("### 진행 단계")
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -697,10 +626,15 @@ if st.session_state.page_mode == "input":
             st.warning("최소한 프로그램명과 프로그램 목적은 입력하세요.")
         else:
             with st.spinner("SPEC 초안 생성 중..."):
+                st.session_state.requirement_text = requirement_text
+                st.session_state.structure_text_saved = structure_text
+                st.session_state.table_image_names = ", ".join([f.name for f in table_images]) if table_images else ""
+                st.session_state.table_excel_names = ", ".join([f.name for f in table_files]) if table_files else ""
+
                 st.session_state.spec_draft = generate_spec_draft(
                     requirement=requirement_text,
                     structure_text=structure_text,
-                    llm_provider=llm_provider,
+                    gemini_model_name=gemini_model_name,
                     table_images=table_images,
                     table_files=table_files
                 )
@@ -709,6 +643,7 @@ if st.session_state.page_mode == "input":
                 st.session_state.structured_spec = ""
                 st.session_state.code = ""
                 st.session_state.page_mode = "spec_review"
+                st.rerun()
 
 
 # =========================
@@ -746,15 +681,18 @@ elif st.session_state.page_mode == "spec_review":
 
     if b1.button("요구사항 다시 수정", use_container_width=True):
         st.session_state.page_mode = "input"
+        st.rerun()
 
     if b2.button("보완 반영하여 최종 SPEC 생성", use_container_width=True):
         with st.spinner("최종 SPEC 생성 중..."):
+            st.session_state.supplement_text = supplement_text
             st.session_state.spec_final = generate_final_spec(
                 st.session_state.spec_draft,
                 supplement_text,
-                llm_provider=llm_provider
+                gemini_model_name=gemini_model_name
             )
             st.session_state.page_mode = "spec_final"
+            st.rerun()
 
 
 # =========================
@@ -776,10 +714,18 @@ elif st.session_state.page_mode == "spec_final":
     st.divider()
     st.checkbox("최종 SPEC를 확정합니다.", key="spec_confirmed")
 
+    st.subheader("SPEC 피드백")
+    st.session_state.spec_feedback = st.text_area(
+        "최종 SPEC에 대한 피드백",
+        height=100,
+        value=st.session_state.get("spec_feedback", "")
+    )
+
     b1, b2 = st.columns(2)
 
     if b1.button("보완 단계로 돌아가기", use_container_width=True):
         st.session_state.page_mode = "spec_review"
+        st.rerun()
 
     if b2.button("Structured Spec 생성", use_container_width=True):
         if not st.session_state.spec_confirmed:
@@ -788,9 +734,10 @@ elif st.session_state.page_mode == "spec_final":
             with st.spinner("Structured Spec 생성 중..."):
                 st.session_state.structured_spec = generate_structured_spec(
                     st.session_state.spec_final,
-                    llm_provider=llm_provider
+                    gemini_model_name=gemini_model_name
                 )
                 st.session_state.page_mode = "code_result"
+                st.rerun()
 
 
 # =========================
@@ -812,12 +759,14 @@ elif st.session_state.page_mode == "code_result":
 
     if st.button("CODE 생성", use_container_width=True):
         with st.spinner("CODE 생성 중..."):
+            st.session_state.function_image_names = ", ".join([f.name for f in function_images]) if function_images else ""
             st.session_state.code = generate_code(
                 st.session_state.spec_final,
                 st.session_state.structured_spec,
-                llm_provider=llm_provider,
+                gemini_model_name=gemini_model_name,
                 function_images=function_images
             )
+            st.rerun()
 
     if st.session_state.code:
         st.divider()
@@ -833,34 +782,40 @@ elif st.session_state.page_mode == "code_result":
         )
 
     st.divider()
-    feedback = st.text_area("피드백 입력", height=120)
+    st.subheader("CODE 피드백")
+    st.session_state.code_feedback = st.text_area(
+        "생성된 CODE에 대한 피드백",
+        height=120,
+        value=st.session_state.get("code_feedback", "")
+    )
 
     c_back, c_save = st.columns(2)
 
     if c_back.button("최종 SPEC 화면으로 돌아가기", use_container_width=True):
         st.session_state.page_mode = "spec_final"
+        st.rerun()
 
     if c_save.button("로그 저장", use_container_width=True):
         if not user_name or not user_id:
             st.warning("사용자 이름과 사번을 입력하세요.")
         else:
-            function_image_names = ", ".join([f.name for f in function_images]) if function_images else ""
-
             save_log(
                 user_name=user_name,
                 user_id=user_id,
-                llm_provider=llm_provider,
+                gemini_model_name=gemini_model_name,
                 mode="CODE" if st.session_state.code else "STRUCTURED_SPEC",
-                requirement="",
-                structure_text="",
-                table_image_names="",
-                table_excel_names="",
-                function_image_names=function_image_names,
+                requirement=st.session_state.get("requirement_text", ""),
+                structure_text=st.session_state.get("structure_text_saved", ""),
+                supplement_text=st.session_state.get("supplement_text", ""),
+                table_image_names=st.session_state.get("table_image_names", ""),
+                table_excel_names=st.session_state.get("table_excel_names", ""),
+                function_image_names=st.session_state.get("function_image_names", ""),
                 spec_draft=st.session_state.spec_draft,
                 spec_final=st.session_state.spec_final,
                 structured_spec=st.session_state.structured_spec,
                 code=st.session_state.code,
-                feedback=feedback,
+                spec_feedback=st.session_state.get("spec_feedback", ""),
+                code_feedback=st.session_state.get("code_feedback", ""),
                 rule_version=RULE_VERSION,
                 spec_confirmed="Y" if st.session_state.spec_confirmed else "N"
             )
