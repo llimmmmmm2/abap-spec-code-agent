@@ -72,7 +72,7 @@ bash
 GEMINI_API_KEY=YOUR_GEMINI_KEY
 ```
 
-```
+
 ### 3️⃣ 프로그램 실행
 bash
 streamlit run app.py
@@ -81,7 +81,6 @@ streamlit run app.py
 
 
 ---
-
 ## 📋 6. 화면 및 프로세스 상세 안내
 
 ### STEP 1: 요구사항 입력
