@@ -513,7 +513,7 @@ def build_supplement_text(
 # =========================
 # 헤더
 # =========================
-st.title("ABAP Spec/Code 생성 에이전트_TEST")
+st.title("ABAP Spec/Code 생성 에이전트")
 st.caption("SAP FI ABAP SPEC / CODE 생성 도구")
 
 with st.sidebar:
